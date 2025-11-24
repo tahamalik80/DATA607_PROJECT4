@@ -1,0 +1,540 @@
+---
+title: 'Project 4: Document Classification (Spam vs Ham)'
+author: "Taha Malik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    df_print: paged
+    number_sections: true
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+params:
+  spam_dir: "C:/Users/taham/OneDrive/Documents/Data 607/Project 4/20050311_spam_2/spam_2"
+  ham_dir:  "C:/Users/taham/OneDrive/Documents/Data 607/Project 4/20030228_easy_ham/easy_ham"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 6)
+set.seed(123)
+```
+
+---------------------------------------------------------------------
+Project overview
+---------------------------------------------------------------------
+
+This R Markdown file performs a full document classification workflow for spam detection using the SpamAssassin public corpus (or any similarly structured spam/ham email folders). The pipeline includes:
+
+- Loading raw email files from two directories (spam and ham)
+- Corpus creation and cleaning (tokenization, stopword removal, stemming / optionally lemmatization)
+- Exploratory data analysis: message lengths, most frequent words, word clouds, and per-class comparisons
+- Feature engineering using document-feature matrices (DFM / term frequency and a TF-IDF baseline)
+- Training and evaluating multiple classifiers (Naive Bayes and Random Forest)
+- Evaluation metrics: confusion matrix, precision/recall/F1, ROC/AUC
+- Conclusions, interpretation, and reproducible session info
+
+Important: Update the params$spam_dir and params$ham_dir at the top of this document if your directories differ.
+
+---------------------------------------------------------------------
+1. Load required packages
+---------------------------------------------------------------------
+
+```{r libraries}
+# Install only if missing (commented out by default)
+# install.packages(c("tidyverse","quanteda","caret","e1071","naivebayes","randomForest","pROC","wordcloud","knitr","kableExtra","ggrepel","quanteda.textplots"))
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(quanteda)      # fast tokenization and dfm
+  library(quanteda.textplots)
+  library(caret)         # train/test split, confusionMatrix
+  library(e1071)         # naiveBayes (alternative)
+  library(naivebayes)    # naive_bayes (fast)
+  library(randomForest)  # random forest classifier
+  library(pROC)          # ROC / AUC
+  library(wordcloud)
+  library(knitr)
+  library(kableExtra)
+  library(ggplot2)
+  library(ggrepel)
+})
+```
+
+---------------------------------------------------------------------
+2. Parameters / Paths
+---------------------------------------------------------------------
+
+```{r paths}
+spam_dir <- params$spam_dir
+ham_dir  <- params$ham_dir
+
+cat("Spam folder:", spam_dir, "\n")
+cat("Ham folder: ", ham_dir, "\n")
+```
+
+Note: If you get encoding or path errors on Windows, make sure to use double backslashes (\\) or forward slashes (/). The default parameter values above are set to the directories you provided; change them if needed.
+
+---------------------------------------------------------------------
+3. Utility functions: read emails into data.frame
+---------------------------------------------------------------------
+
+```{r read-files}
+# Read all files in a directory; collapse lines into single text string per file
+read_emails_from_dir <- function(dir_path, label) {
+  files <- list.files(dir_path, full.names = TRUE)
+  # Exclude potential control files like "cmds"
+  files <- files[basename(files) != "cmds"]
+  # Read each file and collapse into single text field (handle encoding differences)
+  df <- tibble(
+    file = files,
+    text = map_chr(files, ~ {
+      txt <- tryCatch(readLines(.x, warn = FALSE, encoding = "UTF-8"),
+                      error = function(e) tryCatch(readLines(.x, warn = FALSE, encoding = "latin1"),
+                                                   error = function(e2) paste0(readBin(.x, what = "raw", n = file.info(.x)$size), collapse = "")))
+      paste(txt, collapse = "\n")
+    }),
+    label = label
+  )
+  return(df)
+}
+
+# load spam and ham
+spam_df <- read_emails_from_dir(spam_dir, "spam")
+ham_df  <- read_emails_from_dir(ham_dir,  "ham")
+
+# Combine and show counts
+emails_df <- bind_rows(spam_df, ham_df) %>% mutate(doc_id = row_number())
+emails_df %>% count(label) %>% knitr::kable()
+```
+
+---------------------------------------------------------------------
+4. Quick data checks and basic EDA
+---------------------------------------------------------------------
+
+```{r basic-eda}
+# Fix encoding so nchar() doesn't break on invalid bytes
+emails_df$text <- iconv(emails_df$text, from = "", to = "UTF-8", sub = "byte")
+
+# Basic statistics
+emails_df <- emails_df %>%
+  mutate(n_chars = nchar(text),
+         n_words = stringr::str_count(text, "\\w+"))
+
+summary_stats <- emails_df %>%
+  group_by(label) %>%
+  summarise(n = n(),
+            mean_chars = mean(n_chars),
+            median_chars = median(n_chars),
+            mean_words = mean(n_words),
+            median_words = median(n_words)) %>%
+  arrange(label)
+
+kable(summary_stats, caption = "Basic length statistics by class") %>% 
+  kable_styling(full_width = FALSE)
+
+# Histogram of message lengths by class
+ggplot(emails_df, aes(x = n_words, fill = label)) +
+  geom_histogram(position = "identity", alpha = 0.6, bins = 60) +
+  scale_x_log10() +
+  labs(title = "Distribution of message lengths (words) by class",
+       x = "Words (log10 scale)", y = "Count", fill = "Label") +
+  theme_minimal()
+```
+
+Interpretation:
+The ham emails are generally shorter, with median length ~3156 characters and ~540 words, while spam emails are noticeably longer on average, with a median ~4108 characters and ~672 words. The log-scaled histogram shows that spam tends to have a heavier tail, suggesting the presence of very long advertisement-style messages. These differences indicate that message length may carry class-related signal, though length alone is not sufficient for reliable classification.
+
+---------------------------------------------------------------------
+5. Rationale for preprocessing choices
+---------------------------------------------------------------------
+
+```{r rationale, echo=FALSE}
+# This brief section documents why we take the preprocessing steps below.
+```
+
+Rationale (short academic justification):
+- Stemming reduces sparsity by collapsing inflected and derived word forms to a common root (e.g., "clicking", "clicked" -> "click"), improving the overlap between documents without substantially changing topical content.
+- Stopword removal removes very high-frequency function words (like "the", "and") that carry little topical information and can dominate raw frequency counts.
+- Removing numbers/punctuation and lowercasing simplifies the token set and reduces spurious features (e.g., various punctuation tokens).
+- Trimming very rare and extremely frequent terms prevents overfitting and reduces model complexity; rare terms often add noise, while extremely common tokens may be non-informative.
+- TF (term-frequency) is a good baseline; TF-IDF helps account for term specificity and is included below as a comparative baseline.
+
+---------------------------------------------------------------------
+6. Text preprocessing and Document-Feature Matrix (DFM)
+---------------------------------------------------------------------
+
+We'll use quanteda for tokenization and dfm creation. Steps:
+
+- Lowercase
+- Remove numbers, punctuation
+- Remove stopwords
+- Stem words
+- Trim features by document frequency
+
+```{r dfm-creation}
+# Create a corpus (quanteda) preserving original order to maintain mapping to emails_df
+qcorpus <- corpus(emails_df$text, docvars = data.frame(label = emails_df$label, file = emails_df$file, doc_id = emails_df$doc_id))
+
+# Tokenize and clean
+tokens_clean <- tokens(qcorpus,
+                       remove_punct = TRUE,
+                       remove_symbols = TRUE,
+                       remove_numbers = TRUE,
+                       remove_separators = TRUE) %>%
+  tokens_tolower() %>%
+  tokens_remove(pattern = stopwords("en")) %>%
+  tokens_wordstem(language = "en")
+
+# Create dfm (document-feature matrix) with term frequency weighting
+dfm_full <- dfm(tokens_clean)
+dim(dfm_full)  # documents x features
+
+# Trim - keep terms that appear in at least 0.5% of documents and at most 99%
+min_docfreq <- 0.005   # 0.5% of documents
+max_docfreq <- 0.99    # 99% of documents
+
+dfm_trimmed <- dfm_trim(dfm_full, min_docfreq = min_docfreq, max_docfreq = max_docfreq, docfreq_type = "prop")
+cat("Trimmed dfm dims:", dim(dfm_trimmed), " (documents x features)\n")
+```
+
+---------------------------------------------------------------------
+6b. Exploratory features: most frequent terms & wordclouds
+---------------------------------------------------------------------
+
+```{r top-terms}
+# Top terms bar plot
+top_features <- names(topfeatures(dfm_trimmed, 25))
+top_features_df <- tibble(term = top_features, freq = as.numeric(topfeatures(dfm_trimmed, 25)))
+
+ggplot(top_features_df, aes(x = reorder(term, freq), y = freq)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 25 terms (overall)", x = NULL, y = "Frequency") +
+  theme_minimal()
+
+# Wordcloud - overall
+set.seed(42)
+textplot_wordcloud(dfm_trimmed, max_words = 150, color = RColorBrewer::brewer.pal(8, "Dark2"))
+```
+
+Interpretation:
+The most frequent spam-associated terms include “click,” “free,” “html,” and URL-related patterns such as “href,” reflecting advertising and promotional content. Ham emails show higher frequencies of mailing-list or conversational terms (such as dates, system-generated headers, and routine communication phrases). This confirms that vocabulary usage differs strongly by class, and supports the use of bag-of-words features for downstream modeling.
+
+```{r class-wordclouds}
+dfm_byclass <- dfm_group(dfm_trimmed, groups = docvars(dfm_trimmed, "label"))
+
+# convert to term-frequency df for each class safely
+tf_matrix_df <- convert(dfm_byclass, to = "data.frame")
+# The first column may be 'document' or 'doc_id' depending on quanteda version
+first_col_name <- colnames(tf_matrix_df)[1]
+tf_matrix <- tf_matrix_df %>% column_to_rownames(first_col_name)
+tf_matrix <- as.data.frame(t(tf_matrix))  # terms x classes
+
+# Top terms per class table
+top_terms_per_class <- map_df(colnames(tf_matrix), function(cl) {
+  freqs <- sort(tf_matrix[[cl]], decreasing = TRUE)
+  n <- min(20, length(freqs))
+  tibble(label = cl, term = names(freqs)[1:n], freq = unname(freqs)[1:n])
+})
+top_terms_per_class %>% group_by(label) %>% slice(1:6) %>% knitr::kable()
+
+# Wordclouds per class
+par(mfrow = c(1,2))
+set.seed(100)
+textplot_wordcloud(dfm_trimmed[docvars(dfm_trimmed,"label") == "spam", ], max_words = 100, colors = brewer.pal(8, "Reds"))
+title("Spam wordcloud")
+textplot_wordcloud(dfm_trimmed[docvars(dfm_trimmed,"label") == "ham", ], max_words = 100, colors = brewer.pal(8, "Blues"))
+title("Ham wordcloud")
+par(mfrow = c(1,1))
+```
+
+Interpretation:
+Terms like "free", "click", "http" may be more frequent in spam, while ham may contain words associated with mailing lists, dates, and conversational text.
+
+---------------------------------------------------------------------
+7. Prepare training and test data (80/20 split)
+---------------------------------------------------------------------
+
+```{r train-test-split}
+# Convert trimmed dfm to a dense matrix only for modeling (quanteda keeps dfm sparse by default; as.matrix will produce dense, be mindful for memory)
+dfm_mat <- as.matrix(dfm_trimmed)
+df_features <- as.data.frame(dfm_mat)
+# Add label column preserving document order
+df_features$label <- docvars(dfm_trimmed, "label")
+
+# Shuffle and split (stratified)
+set.seed(123)
+train_index <- createDataPartition(df_features$label, p = 0.8, list = FALSE)
+train_df <- df_features[train_index, ]
+test_df  <- df_features[-train_index, ]
+
+cat("Train size:", nrow(train_df), "Test size:", nrow(test_df), "\n")
+table(train_df$label) %>% knitr::kable()
+```
+
+---------------------------------------------------------------------
+8. Model 1: Naive Bayes (TF)
+---------------------------------------------------------------------
+
+Naive Bayes is a classical and strong baseline for text classification.
+
+```{r model-naivebayes}
+# Remove label column for predictors
+x_train <- as.matrix(select(train_df, -label))
+y_train <- factor(train_df$label)
+x_test  <- as.matrix(select(test_df, -label))
+y_test  <- factor(test_df$label)
+
+# Train Naive Bayes on raw term-frequency counts
+nb_model <- naive_bayes(x = x_train, y = y_train, usekernel = FALSE)
+nb_model
+
+# Predict probabilities and labels
+nb_pred <- predict(nb_model, x_test)
+nb_prob <- predict(nb_model, x_test, type = "prob")
+
+# Confusion matrix and metrics
+cm_nb <- confusionMatrix(nb_pred, y_test, positive = "spam")
+cm_nb
+```
+
+Show precision, recall, F1:
+
+```{r nb-metrics}
+precision <- cm_nb$byClass["Precision"]
+recall    <- cm_nb$byClass["Recall"]
+f1        <- cm_nb$byClass["F1"]
+
+tibble(Model = "Naive Bayes (TF)", Precision = precision, Recall = recall, F1 = f1) %>% knitr::kable()
+```
+
+ROC / AUC (we need numeric scores for the positive class):
+
+```{r nb-roc}
+if ("spam" %in% colnames(nb_prob)) {
+  roc_nb <- roc(response = as.numeric(y_test == "spam"), predictor = nb_prob[ , "spam"])
+} else {
+  roc_nb <- roc(response = as.numeric(y_test == "spam"), predictor = nb_prob[ , 1])
+}
+plot.roc(roc_nb, main = "Naive Bayes (TF) ROC", col = "#1c61b6")
+auc_nb <- auc(roc_nb)
+auc_nb
+```
+
+Interpretation:
+Naive Bayes reaches an accuracy of 0.8049, with Precision = 0.647, Recall = 1.00, and F1 = 0.786. The model correctly recovers all spam emails (high recall), but it misclassifies a large number of ham emails as spam (lower precision). This behavior is typical of naïve Bayes when class-conditional independence assumptions are violated in high-dimensional text data. The ROC AUC of 0.858 indicates moderate discriminative ability, but there is clear room for improvement.
+
+---------------------------------------------------------------------
+8b. TF-IDF baseline (Naive Bayes on TF-IDF)
+---------------------------------------------------------------------
+
+We include a TF-IDF baseline as requested.
+
+```{r tfidf-baseline}
+# Compute TF-IDF on the trimmed dfm
+dfm_tfidf_obj <- dfm_tfidf(dfm_trimmed)
+df_tfidf_mat <- as.matrix(dfm_tfidf_obj)
+df_tfidf <- as.data.frame(df_tfidf_mat)
+df_tfidf$label <- docvars(dfm_tfidf_obj, "label")
+
+# Use the same train/test split indices (train_index)
+x_train_tfidf <- as.matrix(select(df_tfidf[train_index, ], -label))
+x_test_tfidf  <- as.matrix(select(df_tfidf[-train_index, ], -label))
+y_train_tfidf <- factor(df_tfidf$label[train_index])
+y_test_tfidf  <- factor(df_tfidf$label[-train_index])
+
+# Train Naive Bayes on TF-IDF
+nb_tfidf_model <- naive_bayes(x = x_train_tfidf, y = y_train_tfidf, usekernel = FALSE)
+nb_tfidf_pred <- predict(nb_tfidf_model, x_test_tfidf)
+nb_tfidf_prob <- predict(nb_tfidf_model, x_test_tfidf, type = "prob")
+
+cm_nb_tfidf <- confusionMatrix(nb_tfidf_pred, y_test_tfidf, positive = "spam")
+cm_nb_tfidf
+
+# ROC/AUC
+roc_nb_tfidf <- roc(response = as.numeric(y_test_tfidf == "spam"), predictor = nb_tfidf_prob[, "spam"])
+auc_nb_tfidf <- auc(roc_nb_tfidf)
+auc_nb_tfidf
+```
+
+Quick comparison: TF-IDF may change the balance between precision and recall; include it in the model comparison table below.
+
+---------------------------------------------------------------------
+9. Model 2: Random Forest (trained on top-K features matrix)
+---------------------------------------------------------------------
+
+Random forest is more computationally intensive; limit the number of features to top-K most frequent terms to reduce memory and training time. We'll train on matrix inputs as recommended.
+
+```{r rf-prepare}
+# choose top K features by overall frequency using training data only
+term_sums_train <- colSums(select(train_df, -label))
+K <- 1000  # adjust as needed
+top_terms <- names(sort(term_sums_train, decreasing = TRUE))[1:min(K, length(term_sums_train))]
+
+x_train_rf <- as.matrix(train_df %>% select(all_of(top_terms)))
+x_test_rf  <- as.matrix(test_df  %>% select(all_of(top_terms)))
+y_train_rf <- y_train
+y_test_rf  <- y_test
+
+cat("RF features:", length(top_terms), "\n")
+```
+
+Train a random forest (on matrix):
+
+```{r rf-train}
+set.seed(234)
+rf_model <- randomForest(x = x_train_rf, y = y_train_rf, ntree = 200, importance = TRUE)
+print(rf_model)
+
+rf_pred <- predict(rf_model, x_test_rf)
+cm_rf <- confusionMatrix(rf_pred, y_test_rf, positive = "spam")
+cm_rf
+```
+
+Show RF feature importance (top 20):
+
+```{r rf-importance}
+imp <- importance(rf_model)
+imp_df <- as.data.frame(imp) %>% rownames_to_column("term") %>% arrange(desc(MeanDecreaseGini))
+imp_df %>% slice(1:20) %>% knitr::kable()
+
+ggplot(imp_df %>% slice(1:20), aes(reorder(term, MeanDecreaseGini), MeanDecreaseGini)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(title = "Top 20 important terms (Random Forest)", x = NULL, y = "MeanDecreaseGini") +
+  theme_minimal()
+```
+
+Compute precision/recall/F1 and ROC:
+
+```{r rf-metrics}
+# Precision/Recall/F1
+tibble(
+  Model = "Random Forest",
+  Precision = cm_rf$byClass["Precision"],
+  Recall    = cm_rf$byClass["Recall"],
+  F1        = cm_rf$byClass["F1"]
+) %>% knitr::kable()
+
+# Predict probabilities on TEST SET USING MATRIX
+rf_prob_spam <- predict(rf_model, newdata = x_test_rf, type = "prob")[, "spam"]
+
+# Compute ROC
+roc_rf <- roc(response = as.numeric(y_test_rf == "spam"), predictor = rf_prob_spam)
+plot.roc(roc_rf, main = "Random Forest ROC", col = "#b21c1c")
+auc_rf <- auc(roc_rf)
+auc_rf
+```
+
+Interpretation:
+The Random Forest model performs extremely well, achieving Accuracy = 0.996, Precision = 0.996, Recall = 0.993, and F1 = 0.995. Only three misclassifications occur in the entire test set. The AUC of 0.9999 confirms near-perfect separation between spam and ham. Top features such as “click,” “html,” “href,” “jalapeno,” and server-related tokens indicate that the model leverages both promotional vocabulary and structural artifacts of the emails. Compared to Naive Bayes, Random Forest captures far richer nonlinear interactions among words.
+
+---------------------------------------------------------------------
+10. Model comparison
+---------------------------------------------------------------------
+
+```{r compare-models}
+# Collect metrics for comparison
+nb_prec <- as.numeric(cm_nb$byClass["Precision"])
+nb_rec  <- as.numeric(cm_nb$byClass["Recall"])
+nb_f1   <- as.numeric(cm_nb$byClass["F1"])
+nb_auc  <- as.numeric(auc_nb)
+
+nb_tfidf_prec <- as.numeric(cm_nb_tfidf$byClass["Precision"])
+nb_tfidf_rec  <- as.numeric(cm_nb_tfidf$byClass["Recall"])
+nb_tfidf_f1   <- as.numeric(cm_nb_tfidf$byClass["F1"])
+nb_tfidf_auc  <- as.numeric(auc_nb_tfidf)
+
+rf_prec <- as.numeric(cm_rf$byClass["Precision"])
+rf_rec  <- as.numeric(cm_rf$byClass["Recall"])
+rf_f1   <- as.numeric(cm_rf$byClass["F1"])
+rf_auc  <- as.numeric(auc_rf)
+
+results_df <- tibble(
+  Model = c("Naive Bayes (TF)", "Naive Bayes (TF-IDF)", "Random Forest"),
+  Precision = c(nb_prec, nb_tfidf_prec, rf_prec),
+  Recall = c(nb_rec, nb_tfidf_rec, rf_rec),
+  F1 = c(nb_f1, nb_tfidf_f1, rf_f1),
+  AUC = c(nb_auc, nb_tfidf_auc, rf_auc)
+)
+
+results_df %>% knitr::kable(digits = 4)
+
+# barplot for primary metrics
+results_long <- results_df %>% pivot_longer(cols = Precision:F1, names_to = "Metric", values_to = "Value")
+
+ggplot(results_long, aes(x = Metric, y = Value, fill = Model)) +
+  geom_col(position = "dodge") +
+  labs(title = "Model performance comparison", y = "Score") +
+  theme_minimal()
+```
+
+Interpretation:
+The Random Forest substantially outperforms Naive Bayes across all metrics. Naive Bayes offers perfect spam recall but struggles with precision, producing many false positives. Random Forest, by contrast, achieves both high precision and high recall simultaneously. This demonstrates that tree-based ensemble models handle sparse, high-dimensional text features far more effectively than linear-probabilistic methods in this dataset. For operational use, Random Forest is clearly the superior model.
+
+---------------------------------------------------------------------
+11. Example predictions (inspect errors / false positives & false negatives)
+---------------------------------------------------------------------
+
+```{r inspect-errors}
+# Reconstruct test indices relative to dfm_trimmed
+test_index <- setdiff(seq_len(nrow(dfm_trimmed)), train_index)
+
+# Build table with original text and predictions
+inspect_df <- tibble(
+  id         = test_index,
+  true_label = y_test,
+  pred_nb    = nb_pred,
+  pred_rf    = rf_pred,
+  text       = emails_df$text[test_index]
+)
+
+# Add short preview for readability
+inspect_df <- inspect_df %>%
+  mutate(text_preview = str_replace_all(substr(text, 1, 160), "\\s+", " "))
+
+# Filter only misclassified by Naive Bayes and label error type
+errors_df <- inspect_df %>%
+  filter((pred_nb == "spam" & true_label == "ham") |
+         (pred_nb == "ham" & true_label == "spam")) %>%
+  mutate(error_type = case_when(
+      pred_nb == "spam" & true_label == "ham" ~ "False Positive (NB)",
+      pred_nb == "ham" & true_label == "spam" ~ "False Negative (NB)"
+  )) %>%
+  slice(1:10) %>%
+  select(id, true_label, pred_nb, pred_rf, error_type, text_preview) %>%
+  knitr::kable(caption = "Example errors by Naive Bayes (showing first 10)")
+
+errors_df
+```
+
+To inspect the raw text of a particular example, locate it via its id and print the corresponding emails_df$text entry to examine why the model erred.
+
+---------------------------------------------------------------------
+12. Notes, limitations, and suggestions for improvements
+---------------------------------------------------------------------
+
+- Preprocessing: We used stemming and stopword removal. Consider leaving words unstemmed or using lemmatization (via spaCy / UDPipe) for potentially better interpretability.
+- Feature engineering: Consider TF-IDF weighting (we included a baseline), n-grams (bigrams/trigrams), character-level n-grams, and phrase detection.
+- Class imbalance: If your dataset has class imbalance, try stratified sampling, class weights, or resampling (SMOTE).
+- Model tuning: Use caret or tidymodels to perform cross-validation and hyperparameter tuning for Random Forest, SVM, or gradient boosting (xgboost).
+- Computational limits: For very large corpora, consider using a more memory-efficient pipeline (sparse matrices on disk) or feature selection before model training.
+
+---------------------------------------------------------------------
+13. Conclusions
+---------------------------------------------------------------------
+
+Conclusions:
+This project implemented a full supervised document-classification pipeline for spam detection, including preprocessing, tokenization, feature construction, exploratory analysis, and model evaluation. Naive Bayes provided a strong baseline but showed limitations, achieving high recall at the cost of misclassifying many ham emails. The Random Forest model demonstrated near-perfect performance, correctly identifying almost all messages and achieving an AUC of 0.9999.
+
+These results indicate that more expressive, nonlinear models better capture the structure of email text. Future enhancements such as TF-IDF weighting, n-grams, character-level features, and hyperparameter tuning could further strengthen the classifier, but the current Random Forest already performs at a level suitable for real-world deployment.
+
+---------------------------------------------------------------------
+14. Reproducibility: Session Info
+---------------------------------------------------------------------
+
+```{r session-info}
+sessionInfo()
+```
